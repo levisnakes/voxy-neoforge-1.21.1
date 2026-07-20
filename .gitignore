@@ -9,7 +9,6 @@
 # Reference dependency clones for development
 /.reference/
 
-# Agent orchestration task files
 /.agent/
 
 # Local deployment scripts (contain SSH config)

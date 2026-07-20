@@ -90,8 +90,6 @@ The built JAR will be in `build/libs/`.
 
 ## Contributing
 
-For development guidelines, see [CLAUDE.md](CLAUDE.md).
-
 ### Validation Scripts
 
 The `scripts/` directory contains build validation tools used in CI.
