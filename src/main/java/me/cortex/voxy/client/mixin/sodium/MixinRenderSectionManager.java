@@ -37,10 +37,23 @@ public class MixinRenderSectionManager {
 
     @Shadow @Final private ChunkBuilder builder;
 
-    // Sodium 0.6.13: Constructor signature is (ClientLevel, int, CommandList)
-    // SortBehavior parameter removed in Sodium 0.6.x
-    @Inject(method = "<init>", at = @At("TAIL"))
-    private void voxy$resetChunkTracker(ClientLevel level, int renderDistance, CommandList commandList, CallbackInfo ci) {
+    // The constructor gained a SortBehavior parameter again in Sodium 0.8.x:
+    //   0.6.x: (ClientLevel, int, CommandList)
+    //   0.8.x: (ClientLevel, int, SortBehavior, CommandList)
+    // Both are declared with a FULL descriptor + require = 0 so the non-matching one simply
+    // finds no target (instead of failing the descriptor check and crashing the game).
+    @Inject(method = "<init>(Lnet/minecraft/client/multiplayer/ClientLevel;ILnet/caffeinemc/mods/sodium/client/gl/device/CommandList;)V", at = @At("TAIL"), require = 0)
+    private void voxy$resetChunkTrackerLegacy(ClientLevel level, int renderDistance, CommandList commandList, CallbackInfo ci) {
+        voxy$onManagerInit(level);
+    }
+
+    @Inject(method = "<init>(Lnet/minecraft/client/multiplayer/ClientLevel;ILnet/caffeinemc/mods/sodium/client/render/chunk/translucent_sorting/SortBehavior;Lnet/caffeinemc/mods/sodium/client/gl/device/CommandList;)V", at = @At("TAIL"), require = 0)
+    private void voxy$resetChunkTracker(ClientLevel level, int renderDistance, SortBehavior sortBehavior, CommandList commandList, CallbackInfo ci) {
+        voxy$onManagerInit(level);
+    }
+
+    @Unique
+    private void voxy$onManagerInit(ClientLevel level) {
         if (level.levelRenderer != null) {
             var system = ((IGetVoxyRenderSystem)(level.levelRenderer)).getVoxyRenderSystem();
             if (system != null) {

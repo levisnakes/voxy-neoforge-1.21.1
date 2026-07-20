@@ -12,7 +12,7 @@ import java.util.Set;
 
 @Mixin(value = PackRenderTargetDirectives.class, remap = false)
 public class MixinPackRenderTargetDirectives {
-    @Redirect(method = "<clinit>", at = @At(value = "INVOKE", target = "Lcom/google/common/collect/ImmutableSet$Builder;build()Lcom/google/common/collect/ImmutableSet;"))
+    @Redirect(method = "<clinit>", at = @At(value = "INVOKE", target = "Lcom/google/common/collect/ImmutableSet$Builder;build()Lcom/google/common/collect/ImmutableSet;"), require = 0)
     private static ImmutableSet<Integer> voxy$injectExtraColourTex(ImmutableSet.Builder<Integer> builder) {
         int limit = System.getProperty("voxy.IrisExtremeColourTexOverride", "false").equalsIgnoreCase("true")?200:20;
         for (int i = 16; i < limit; i++) {

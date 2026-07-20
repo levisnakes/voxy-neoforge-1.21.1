@@ -33,7 +33,9 @@ public class VoxySamplers {
                     return 0;
                 }
                 return dt.id;
-            }, ()->GlSampler.MIPPED_NEAREST_NEAREST, opaqueNames);
+            // Iris 1.8: addDynamicSampler takes a GlSampler directly (newer Iris uses Supplier<GlSampler>),
+            // and the constant is MIPPED_NEAREST (MIPPED_NEAREST_NEAREST was a later rename)
+            }, GlSampler.MIPPED_NEAREST, opaqueNames);
 
             samplers.addDynamicSampler(TextureType.TEXTURE_2D, () -> {
                 var pipeData = ((IGetIrisVoxyPipelineData)pipeline).voxy$getPipelineData();
@@ -49,7 +51,7 @@ public class VoxySamplers {
                     return 0;
                 }
                 return dt.id;
-            }, ()->GlSampler.MIPPED_NEAREST_NEAREST, translucentNames);
+            }, GlSampler.MIPPED_NEAREST, translucentNames);
         }
     }
 }

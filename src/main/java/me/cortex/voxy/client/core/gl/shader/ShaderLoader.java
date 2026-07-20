@@ -7,6 +7,7 @@ import org.apache.commons.io.IOUtils;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -49,7 +50,7 @@ public class ShaderLoader {
         String processed = "\n" + shaderSource + "\n//beans";
 
         // Apply Sodium's shader constants processing (handles #define etc.)
-        processed = ShaderParser.parseShader(processed, ShaderConstants.builder().build());
+        processed = invokeParseShader(processed);
 
         // Normalize line endings and strip original #version (upstream behavior)
         processed = processed.replaceAll("\r\n", "\n");
@@ -57,6 +58,52 @@ public class ShaderLoader {
 
         // Prepend our target GLSL version
         return "#version 460 core\n" + processed;
+    }
+
+    /**
+     * Calls Sodium's ShaderParser.parseShader reflectively so one jar works across
+     * Sodium versions whose return type differs:
+     *   Sodium 0.6.x : parseShader(String, ShaderConstants) -> String
+     *   Sodium 0.8.x : parseShader(String, ShaderConstants) -> ShaderParser.ParsedShader (record, .src())
+     * A direct call bakes the return type into the bytecode descriptor, which throws
+     * NoSuchMethodError on the other version.
+     */
+    private static final Method PARSE_SHADER = resolveParseShader();
+
+    private static Method resolveParseShader() {
+        try {
+            // getMethod matches on name + parameter types only, so it resolves on both versions
+            return ShaderParser.class.getMethod("parseShader", String.class, ShaderConstants.class);
+        } catch (NoSuchMethodException e) {
+            throw new RuntimeException("Incompatible Sodium: ShaderParser.parseShader(String, ShaderConstants) not found", e);
+        }
+    }
+
+    private static String invokeParseShader(String source) {
+        ShaderConstants constants = ShaderConstants.builder().build();
+        Object result;
+        try {
+            result = PARSE_SHADER.invoke(null, source, constants);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException("Failed to invoke Sodium ShaderParser.parseShader", e);
+        }
+        if (result instanceof String s) {
+            return s;// Sodium 0.6.x
+        }
+        if (result == null) {
+            throw new RuntimeException("Sodium ShaderParser.parseShader returned null");
+        }
+        // Sodium 0.8.x: unwrap the ParsedShader record
+        try {
+            Method src = result.getClass().getMethod("src");
+            Object unwrapped = src.invoke(result);
+            if (unwrapped instanceof String s) {
+                return s;
+            }
+            throw new RuntimeException("Sodium ParsedShader.src() did not return a String");
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException("Unsupported Sodium ShaderParser return type: " + result.getClass().getName(), e);
+        }
     }
 
     /**

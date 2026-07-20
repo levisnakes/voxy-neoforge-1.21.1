@@ -28,6 +28,15 @@ public class VoxyClientEvents {
      */
     @SubscribeEvent
     public static void onRenderFog(ViewportEvent.RenderFog event) {
+        // 3D map view: kill all fog regardless of mode so the map camera
+        // (which sits thousands of blocks up) sees clear terrain
+        if (me.cortex.voxy.client.voxymap.VoxyMapCameraController.isActive()) {
+            event.setNearPlaneDistance(999999.0f);
+            event.setFarPlaneDistance(9999999.0f);
+            event.setCanceled(true);
+            return;
+        }
+
         // Only modify terrain fog when Voxy is enabled and rendering
         if (event.getMode() == FogRenderer.FogMode.FOG_TERRAIN
                 && VoxyConfig.CONFIG.enabled

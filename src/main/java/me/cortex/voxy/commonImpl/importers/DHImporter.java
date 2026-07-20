@@ -25,9 +25,6 @@ import net.minecraft.world.level.block.state.BlockState;
 import org.apache.commons.io.IOUtils;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.util.zstd.Zstd;
-import org.tukaani.xz.BasicArrayCache;
-import org.tukaani.xz.ResettableArrayCache;
-import org.tukaani.xz.XZInputStream;
 
 import java.io.DataInputStream;
 import java.io.File;
@@ -72,7 +69,6 @@ public class DHImporter implements IDataImporter {
     private final ConcurrentLinkedDeque<Task> tasks = new ConcurrentLinkedDeque<>();
     private static final class WorkCTX {
         private final PreparedStatement stmt;
-        private final ResettableArrayCache cache;
         private final long[] storageCache;
         private final byte[] colScratch;
         private final VoxelizedSection section;
@@ -83,7 +79,6 @@ public class DHImporter implements IDataImporter {
 
         public WorkCTX(PreparedStatement stmt, int worldHeight) {
             this.stmt = stmt;
-            this.cache = new ResettableArrayCache(new BasicArrayCache());
             this.storageCache = new long[64*16*worldHeight];
             this.colScratch = new byte[1<<16];
             this.section = VoxelizedSection.createEmpty();
@@ -120,13 +115,31 @@ public class DHImporter implements IDataImporter {
         this.service = servicePool.createService(()->{
             try {
                 var dataFetchStmt = this.db.prepareStatement("SELECT Data,ColumnGenerationStep,Mapping FROM FullData WHERE DetailLevel = 0 AND PosX = ? AND PosZ = ?;");
+                PreparedStatement v2FetchStmtTmp = null;
+                try {
+                    v2FetchStmtTmp = this.db.prepareStatement("SELECT Data,Mapping,NorthAdjData,SouthAdjData,EastAdjData,WestAdjData FROM FullData WHERE DetailLevel = 0 AND PosX = ? AND PosZ = ?;");
+                } catch (SQLException e) {
+                    //databases from before DH added the adjacent data columns only contain format 1 rows
+                }
+                final var v2FetchStmt = v2FetchStmtTmp;
                 var ctx = new WorkCTX(dataFetchStmt, this.worldHeightSections*16);
                 return new Pair<>(()->{
-                    this.importSection(dataFetchStmt, ctx, this.tasks.poll());
+                    var task = this.tasks.poll();
+                    if (task == null) {
+                        return;
+                    }
+                    if (task.fmt == 2) {
+                        this.importSectionV2(v2FetchStmt, ctx, task);
+                    } else {
+                        this.importSection(dataFetchStmt, ctx, task);
+                    }
                 },()->{
                     ctx.free();
                     try {
                         dataFetchStmt.close();
+                        if (v2FetchStmt != null) {
+                            v2FetchStmt.close();
+                        }
                     } catch (SQLException e) {
                         throw new RuntimeException(e);
                     }
@@ -152,12 +165,15 @@ public class DHImporter implements IDataImporter {
                     int z = resSet.getInt(2);
                     int compression = resSet.getInt(3);
                     int format = resSet.getInt(4);
-                    if (format != 1) {
+                    if (format != 1 && format != 2) {
                         Logger.warn("Unknown format mode: " + format);
                         continue;
                     }
-                    if (compression != 3 && compression != 4) {
-                        Logger.warn("Unknown compression mode: " + compression);
+                    if (compression != 4) {
+                        //mode 3 is LZMA2, which needs org.tukaani.xz. That library is not bundled
+                        // (it collides with Distant Horizons' own copy under JPMS), so LZMA-compressed
+                        // sections are skipped. Modern DH defaults to zstd (mode 4) so this is rare.
+                        Logger.warn("Unsupported DH compression mode (only zstd/4 supported): " + compression);
                         continue;
                     }
                     taskQ.add(new Task(x, z, format, compression));
@@ -302,36 +318,45 @@ public class DHImporter implements IDataImporter {
     }
 
     private static InputStream createDecompressedStream(int decompressor, InputStream in, WorkCTX ctx) throws IOException {
-        if (decompressor == 3) {
-            ctx.cache.reset();
-            return new XZInputStream(IOUtils.toBufferedInputStream(in), -1, false, ctx.cache);
-        } else if (decompressor == 4) {
+        if (decompressor == 4) {
             if (ctx.zstdScratch == null) {
                 ctx.zstdScratch = MemoryUtil.memAlloc(8196);
                 ctx.zstdScratch2 = MemoryUtil.memAlloc(8196);
             }
             ctx.zstdScratch.clear();
             ctx.zstdScratch2.clear();
+            //read the entire blob, growing the scratch buffer whenever it fills up
+            // (IOUtils.read fills the buffer's remaining space, so a non-full buffer means EOF)
             try(var channel = Channels.newChannel(in)) {
-                while (IOUtils.read(channel, ctx.zstdScratch) == 0) {
-                    var newBuffer = MemoryUtil.memAlloc(ctx.zstdScratch.position()*2);
-                    newBuffer.put(ctx.zstdScratch.rewind());
+                while (true) {
+                    IOUtils.read(channel, ctx.zstdScratch);
+                    if (ctx.zstdScratch.hasRemaining()) {
+                        break;
+                    }
+                    var newBuffer = MemoryUtil.memAlloc(ctx.zstdScratch.capacity()*2);
+                    ctx.zstdScratch.flip();
+                    newBuffer.put(ctx.zstdScratch);
                     MemoryUtil.memFree(ctx.zstdScratch);
                     ctx.zstdScratch = newBuffer;
                 }
             }
             ctx.zstdScratch.limit(ctx.zstdScratch.position()).rewind();
             {
-                int decompSize = (int) Zstd.ZSTD_getFrameContentSize(ctx.zstdScratch);
+                long decompSize = Zstd.ZSTD_getFrameContentSize(ctx.zstdScratch);
+                if (decompSize < 0 || decompSize > (Integer.MAX_VALUE/2)) {
+                    throw new IllegalStateException("Invalid zstd frame content size: " + decompSize);
+                }
                 if (ctx.zstdScratch2.capacity() < decompSize) {
                     MemoryUtil.memFree(ctx.zstdScratch2);
                     ctx.zstdScratch2 = MemoryUtil.memAlloc((int) (decompSize * 1.1));
                 }
             }
-            long size = Zstd.ZSTD_decompressDCtx(ctx.zstdDCtx, ctx.zstdScratch, ctx.zstdScratch2);
+            //ZSTD_decompressDCtx takes (dctx, dst, src)
+            long size = Zstd.ZSTD_decompressDCtx(ctx.zstdDCtx, ctx.zstdScratch2, ctx.zstdScratch);
             if (Zstd.ZSTD_isError(size)) {
                 throw new IllegalStateException("ZSTD EXCEPTION: " + Zstd.ZSTD_getErrorName(size));
             }
+            ctx.zstdScratch2.position(0);
             ctx.zstdScratch2.limit((int) size);
             return new ByteBufferBackedInputStream(ctx.zstdScratch2);
         } else {
@@ -422,6 +447,201 @@ public class DHImporter implements IDataImporter {
         }
     }
 
+    private static int readVarint(DataInputStream in) throws IOException {
+        int value = 0;
+        int shift = 0;
+        byte b;
+        do {
+            if (shift >= 32) {
+                throw new IOException("Invalid varint");
+            }
+            b = in.readByte();
+            value |= (b & 127) << shift;
+            shift += 7;
+        } while ((b & 128) != 0);
+        return value;
+    }
+
+    private static int zigzagDecode(int n) {
+        return (n >>> 1) ^ -(n & 1);
+    }
+
+    //Decodes a DH format 2 blob (see DH's FullDataSourceV2DTO#readBlobToDataSourceDataArrayV2) into
+    // the same datapoint longs as format 1. The blob is 5 sequential streams over the given column
+    // range: varint column lengths, varint (id<<2 | lightFlag<<1 | discontinuityFlag), varint heights,
+    // zigzag varint bottomY prediction errors (only for flagged datapoints), then packed light bytes
+    // (only for flagged datapoints). The flags are stashed in the minY/blockLight bit fields until the
+    // pass that resolves them, mirroring DH's own reader.
+    private void readV2Blob(InputStream in, long[][] cols, int minX, int maxX, int minZ, int maxZ) throws IOException {
+        var stream = new DataInputStream(in);
+        // 1. column lengths
+        for (int x = minX; x < maxX; x++) {
+            for (int z = minZ; z < maxZ; z++) {
+                int count = readVarint(stream);
+                if (count > 8192) {
+                    throw new IOException("Corrupt column length: " + count);
+                }
+                cols[(x<<6)|z] = new long[count];
+            }
+        }
+        // 2. ids, with the discontinuity/light flags stashed in the minY/blockLight fields
+        for (int x = minX; x < maxX; x++) {
+            for (int z = minZ; z < maxZ; z++) {
+                long[] col = cols[(x<<6)|z];
+                for (int i = 0; i < col.length; i++) {
+                    int enc = readVarint(stream);
+                    col[i] = ((long)(enc >>> 2)) | (((long)(enc & 1)) << 44) | (((long)((enc >>> 1) & 1)) << 60);
+                }
+            }
+        }
+        // 3. heights
+        for (int x = minX; x < maxX; x++) {
+            for (int z = minZ; z < maxZ; z++) {
+                long[] col = cols[(x<<6)|z];
+                for (int i = 0; i < col.length; i++) {
+                    col[i] |= ((long)(readVarint(stream) & 0xFFF)) << 32;
+                }
+            }
+        }
+        // 4. bottomY, predicted as directly below the previous datapoint, only mispredictions are stored
+        int previousBottomY = 0;
+        for (int x = minX; x < maxX; x++) {
+            for (int z = minZ; z < maxZ; z++) {
+                long[] col = cols[(x<<6)|z];
+                for (int i = 0; i < col.length; i++) {
+                    long data = col[i];
+                    int error = 0;
+                    if (((data >>> 44) & 1) != 0) {
+                        error = zigzagDecode(readVarint(stream));
+                    }
+                    int bottomY = previousBottomY - ((int)((data >>> 32) & 0xFFF)) + error;
+                    previousBottomY = bottomY;
+                    col[i] = (data & ~(0xFFFL << 44)) | (((long)(bottomY & 0xFFF)) << 44);
+                }
+            }
+        }
+        // 5. packed light for datapoints with the light flag set
+        for (int x = minX; x < maxX; x++) {
+            for (int z = minZ; z < maxZ; z++) {
+                long[] col = cols[(x<<6)|z];
+                for (int i = 0; i < col.length; i++) {
+                    long data = col[i];
+                    if (((data >>> 60) & 0xF) != 0) {
+                        int packed = stream.readByte();
+                        col[i] = (data & ~(0xFFL << 56)) | (((long)(packed & 0xF)) << 56) | (((long)((packed >>> 4) & 0xF)) << 60);
+                    }
+                }
+            }
+        }
+        stream.close();
+    }
+
+    //Same storage fill + section flush as readColumnData, but sourced from pre-decoded columns
+    // since format 2 stores fields column-major across the whole blob instead of streaming per column
+    private void processColumns(int X, int Z, long[][] cols, WorkCTX ctx, long[] mapping) {
+        long[] storage = ctx.storageCache;
+        VoxelizedSection section = ctx.section;
+        for (int x = 0; x < 64; x++) {
+            for (int z = 0; z < 64; z++) {
+                int bPos = Integer.expand(x&0xF, 0b00_00_0000_0000_1111) |
+                           Integer.expand(z, 0b00_11_0000_1111_0000);
+                long[] col = cols[(x<<6)|z];
+                if (col == null) {
+                    continue;
+                }
+                for (long entry : col) {
+                    long mEntry = Mapper.withLight(mapping[getId(entry)], (getBlockLight(entry) << 4) | getSkyLight(entry));
+                    int startY = getMinHeight(entry);
+                    int tall = getHeight(entry);
+                    int endY = Math.min(startY+tall, this.worldHeightSections*16);
+                    if (endY <= startY) {
+                        continue;
+                    }
+                    startY = Integer.expand(startY, 0b11111111_00_1111_0000_0000);
+                    endY = Integer.expand(endY, 0b11111111_00_1111_0000_0000);
+                    final int Msk = 0b11111111_00_1111_0000_0000;
+                    final int iMsk1 = (~Msk)+1;
+                    for (int y = startY; y != endY; y = (y+iMsk1)&Msk) {
+                        storage[y+bPos] = mEntry;
+                    }
+                }
+            }
+
+            if ((x+1)%16==0) {
+                for (int sz = 0; sz < 4; sz++) {
+                    for (int sy = 0; sy < this.worldHeightSections; sy++) {
+                        {
+                            int base = (sz|(sy<<2))<<12;
+                            int nonAirCount = 0;
+                            final var dat = section.section;
+                            for (int i = 0; i < 4096; i++) {
+                                nonAirCount += Mapper.isAir(dat[i] = storage[i+base])?0:1;
+                            }
+                            section.lvl0NonAirCount = nonAirCount;
+                        }
+
+                        WorldConversionFactory.mipSection(section, this.engine.getMapper());
+
+                        section.setPosition(X*4+(x>>4), sy+(this.bottomOfWorld>>4), (Z*4)+sz);
+                        WorldUpdater.insertUpdate(this.engine, section);
+                    }
+
+                    int count = this.processedChunks.incrementAndGet();
+                    this.updateCallback.onUpdate(count, this.totalChunks);
+                }
+                Arrays.fill(storage, 0);
+            }
+        }
+    }
+
+    private void importSectionV2(PreparedStatement dataFetchStmt, WorkCTX ctx, Task task) {
+        if (!this.isRunning) {
+            return;
+        }
+        if (dataFetchStmt == null) {
+            Logger.warn("DH database is missing the adjacent data columns, cannot import format 2 section at " + task.x + ", " + task.z);
+            return;
+        }
+        try {
+            dataFetchStmt.setInt(1, task.x);
+            dataFetchStmt.setInt(2, task.z);
+            try (var rs = dataFetchStmt.executeQuery()) {
+                var dataBlob = rs.getBinaryStream(1);
+                var mappingBlob = rs.getBinaryStream(2);
+                if (dataBlob == null || mappingBlob == null) {
+                    return;
+                }
+                var mapping = readMappings(createDecompressedStream(task.compression, mappingBlob, ctx), ctx);
+                var cols = new long[64*64][];
+                //the main blob only contains the interior 62x62 columns, the border ring is stored
+                // in the four adjacent data blobs (see DH's FullDataMinMaxPosUtil)
+                readV2Blob(createDecompressedStream(task.compression, dataBlob, ctx), cols, 1, 63, 1, 63);
+                var north = rs.getBinaryStream(3);
+                if (north != null) {
+                    readV2Blob(createDecompressedStream(task.compression, north, ctx), cols, 0, 64, 0, 1);
+                }
+                var south = rs.getBinaryStream(4);
+                if (south != null) {
+                    readV2Blob(createDecompressedStream(task.compression, south, ctx), cols, 0, 64, 63, 64);
+                }
+                var east = rs.getBinaryStream(5);
+                if (east != null) {
+                    readV2Blob(createDecompressedStream(task.compression, east, ctx), cols, 63, 64, 0, 64);
+                }
+                var west = rs.getBinaryStream(6);
+                if (west != null) {
+                    readV2Blob(createDecompressedStream(task.compression, west, ctx), cols, 0, 1, 0, 64);
+                }
+                this.processColumns(task.x, task.z, cols, ctx, mapping);
+            }
+        } catch (Exception e) {
+            //don't let one corrupt section abort the entire import, but clear any partially
+            // filled storage so it can't leak into the next section processed by this worker
+            Arrays.fill(ctx.storageCache, 0);
+            Logger.warn("Failed to import DH format 2 section at " + task.x + ", " + task.z, e);
+        }
+    }
+
     public void shutdown() {
         if (!this.isRunning) {
             return;
@@ -468,11 +688,10 @@ public class DHImporter implements IDataImporter {
         boolean hasJDBC = false;
         try {
             Class.forName("org.sqlite.JDBC");
-            Class.forName("org.tukaani.xz.XZInputStream");
             hasJDBC = true;
         } catch (ClassNotFoundException | NoClassDefFoundError e) {
             //throw new RuntimeException(e);
-            Logger.warn("Unable to load sqlite JDBC or lzma decompressor, DHImporting wont be available", e);
+            Logger.warn("Unable to load sqlite JDBC, DHImporting wont be available", e);
         }
         HasRequiredLibraries = hasJDBC;
     }

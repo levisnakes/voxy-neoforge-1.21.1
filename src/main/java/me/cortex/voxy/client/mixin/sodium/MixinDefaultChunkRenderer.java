@@ -30,21 +30,43 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
         super(device, vertexType);
     }
 
-    // Sodium 0.6.13: render signature is (ChunkRenderMatrices, CommandList, ChunkRenderListIterable, TerrainRenderPass, CameraTransform)
-    // boolean indexedRenderingEnabled parameter removed in Sodium 0.6.x
-    @Inject(method = "render", at = @At(value = "HEAD"), cancellable = true)
+    // render() gained a trailing boolean (indexed rendering) in Sodium 0.8.x:
+    //   0.6.x: (ChunkRenderMatrices, CommandList, ChunkRenderListIterable, TerrainRenderPass, CameraTransform)
+    //   0.8.x: (..., CameraTransform, boolean)
+    // Each variant is declared with a FULL descriptor + require = 0, so on any given Sodium
+    // version the non-matching pair finds no target rather than crashing the descriptor check.
+    @Unique private static final String RENDER_LEGACY = "render(Lnet/caffeinemc/mods/sodium/client/render/chunk/ChunkRenderMatrices;Lnet/caffeinemc/mods/sodium/client/gl/device/CommandList;Lnet/caffeinemc/mods/sodium/client/render/chunk/lists/ChunkRenderListIterable;Lnet/caffeinemc/mods/sodium/client/render/chunk/terrain/TerrainRenderPass;Lnet/caffeinemc/mods/sodium/client/render/viewport/CameraTransform;)V";
+    @Unique private static final String RENDER_INDEXED = "render(Lnet/caffeinemc/mods/sodium/client/render/chunk/ChunkRenderMatrices;Lnet/caffeinemc/mods/sodium/client/gl/device/CommandList;Lnet/caffeinemc/mods/sodium/client/render/chunk/lists/ChunkRenderListIterable;Lnet/caffeinemc/mods/sodium/client/render/chunk/terrain/TerrainRenderPass;Lnet/caffeinemc/mods/sodium/client/render/viewport/CameraTransform;Z)V";
+    @Unique private static final String SHADER_END = "Lnet/caffeinemc/mods/sodium/client/render/chunk/ShaderChunkRenderer;end(Lnet/caffeinemc/mods/sodium/client/render/chunk/terrain/TerrainRenderPass;)V";
+
+    @Inject(method = RENDER_LEGACY, at = @At(value = "HEAD"), cancellable = true, require = 0)
     private void cancelThingie(ChunkRenderMatrices matrices, CommandList commandList, ChunkRenderListIterable renderLists, TerrainRenderPass renderPass, CameraTransform camera, CallbackInfo ci) {
+        voxy$cancelIfDisabled(matrices, renderPass, camera, ci);
+    }
+
+    @Inject(method = RENDER_INDEXED, at = @At(value = "HEAD"), cancellable = true, require = 0)
+    private void cancelThingieIndexed(ChunkRenderMatrices matrices, CommandList commandList, ChunkRenderListIterable renderLists, TerrainRenderPass renderPass, CameraTransform camera, boolean indexedRendering, CallbackInfo ci) {
+        voxy$cancelIfDisabled(matrices, renderPass, camera, ci);
+    }
+
+    @Inject(method = RENDER_LEGACY, at = @At(value = "INVOKE", target = SHADER_END, shift = At.Shift.BEFORE), require = 0)
+    private void injectRender(ChunkRenderMatrices matrices, CommandList commandList, ChunkRenderListIterable renderLists, TerrainRenderPass renderPass, CameraTransform camera, CallbackInfo ci) {
+        this.doRender(matrices, renderPass, camera);
+    }
+
+    @Inject(method = RENDER_INDEXED, at = @At(value = "INVOKE", target = SHADER_END, shift = At.Shift.BEFORE), require = 0)
+    private void injectRenderIndexed(ChunkRenderMatrices matrices, CommandList commandList, ChunkRenderListIterable renderLists, TerrainRenderPass renderPass, CameraTransform camera, boolean indexedRendering, CallbackInfo ci) {
+        this.doRender(matrices, renderPass, camera);
+    }
+
+    @Unique
+    private void voxy$cancelIfDisabled(ChunkRenderMatrices matrices, TerrainRenderPass renderPass, CameraTransform camera, CallbackInfo ci) {
         if (VoxyClient.disableSodiumChunkRender()) {
             super.begin(renderPass);
             this.doRender(matrices, renderPass, camera);
             super.end(renderPass);
             ci.cancel();
         }
-    }
-
-    @Inject(method = "render", at = @At(value = "INVOKE", target = "Lnet/caffeinemc/mods/sodium/client/render/chunk/ShaderChunkRenderer;end(Lnet/caffeinemc/mods/sodium/client/render/chunk/terrain/TerrainRenderPass;)V", shift = At.Shift.BEFORE))
-    private void injectRender(ChunkRenderMatrices matrices, CommandList commandList, ChunkRenderListIterable renderLists, TerrainRenderPass renderPass, CameraTransform camera, CallbackInfo ci) {
-        this.doRender(matrices, renderPass, camera);
     }
 
     @Unique

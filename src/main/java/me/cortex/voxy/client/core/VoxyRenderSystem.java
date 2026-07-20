@@ -31,7 +31,7 @@ import me.cortex.voxy.client.core.rendering.util.PrintfDebugUtil;
 import me.cortex.voxy.client.core.rendering.util.UploadStream;
 import me.cortex.voxy.client.core.util.GPUTiming;
 // MC 1.21.1 NeoForge: Iris shader integration excluded
-// import me.cortex.voxy.client.core.util.IrisUtil;
+import me.cortex.voxy.client.core.util.IrisUtil;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.thread.ServiceManager;
 import me.cortex.voxy.common.world.WorldEngine;
@@ -224,6 +224,11 @@ public class VoxyRenderSystem {
         if (viewport == null) {
             return;
         }
+        //while the 3D map is redirecting voxy rendering into the GUI phase,
+        // skip the normal world-pass render (VoxyMapGuiRenderer calls back in itself)
+        if (me.cortex.voxy.client.voxymap.VoxyMapGuiRenderer.shouldCancelWorldRender()) {
+            return;
+        }
 
         // MC 1.21.1 NeoForge: Fog is handled by VoxyClientEvents.onRenderFog()
         // which listens to ViewportEvent.RenderFog and pushes fog to infinity
@@ -313,8 +318,7 @@ public class VoxyRenderSystem {
                 glBindSampler(i, 0);
             }
 
-            // MC 1.21.1 NeoForge: Iris shader integration excluded - clearIrisSamplers() is a no-op
-            // IrisUtil.clearIrisSamplers();//Thanks iris (sigh)
+            IrisUtil.clearIrisSamplers();//Thanks iris (sigh)
 
             //TODO: should/needto actually restore all of these, not just clear them
             //Clear all the bindings

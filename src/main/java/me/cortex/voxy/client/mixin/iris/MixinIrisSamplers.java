@@ -16,7 +16,7 @@ import java.util.function.Supplier;
 
 @Mixin(value = IrisSamplers.class, remap = false)
 public class MixinIrisSamplers {
-    @Inject(method = "addRenderTargetSamplers", at = @At("TAIL"))
+    @Inject(method = "addRenderTargetSamplers", at = @At("TAIL"), require = 0)
     private static void voxy$injectSamplers(SamplerHolder samplers, Supplier<ImmutableSet<Integer>> flipped, RenderTargets renderTargets, boolean isFullscreenPass, WorldRenderingPipeline pipeline, CallbackInfo ci) {
         if (pipeline instanceof IrisRenderingPipeline ipipe) {
             VoxySamplers.addSamplers(ipipe, samplers);
